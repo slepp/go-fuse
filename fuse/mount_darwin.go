@@ -31,6 +31,17 @@ func unixgramSocketpair() (l, r *os.File, err error) {
 // Create a FUSE FS on the specified mount point.  The returned
 // mount point is always absolute.
 func mount(mountPoint string, opts *MountOptions, ready chan<- error) (fd int, err error) {
+	// Prefer FUSE-T (kext-less, NFS-backed) when available.
+	if bin, fusetErr := fusetBinary(); fusetErr == nil {
+		return mountFuset(bin, mountPoint, opts, ready)
+	}
+
+	return mountMacfuse(mountPoint, opts, ready)
+}
+
+// mountMacfuse mounts via the traditional macFUSE mount helper
+// (mount_macfuse or mount_osxfuse).
+func mountMacfuse(mountPoint string, opts *MountOptions, ready chan<- error) (fd int, err error) {
 	local, remote, err := unixgramSocketpair()
 	if err != nil {
 		return
@@ -39,7 +50,7 @@ func mount(mountPoint string, opts *MountOptions, ready chan<- error) (fd int, e
 	defer local.Close()
 	defer remote.Close()
 
-	bin, err := fusermountBinary()
+	bin, err := macfuseBinary()
 	if err != nil {
 		return 0, err
 	}
@@ -94,19 +105,137 @@ func mount(mountPoint string, opts *MountOptions, ready chan<- error) (fd int, e
 	return fd, err
 }
 
+// mountFuset mounts via FUSE-T's go-nfsv4 server, which translates
+// the FUSE protocol to NFSv4 entirely in userspace (no kernel
+// extension required). Communication uses two Unix socket pairs:
+//
+//   - A data socket (child fd 3) for the FUSE protocol
+//   - A monitoring socket (child fd 4) for mount lifecycle coordination
+//
+// The parent sends "mount" on the monitoring socket and waits for a
+// 4-byte acknowledgement confirming the NFS mount succeeded.
+func mountFuset(bin string, mountPoint string, opts *MountOptions, ready chan<- error) (fd int, err error) {
+	// Data socket pair — carries the FUSE protocol.
+	local, remote, err := unixgramSocketpair()
+	if err != nil {
+		return 0, err
+	}
+	defer remote.Close()
+
+	// Monitoring socket pair — mount lifecycle coordination.
+	localMon, remoteMon, err := unixgramSocketpair()
+	if err != nil {
+		local.Close()
+		return 0, err
+	}
+	defer remoteMon.Close()
+
+	// Build go-nfsv4 arguments.
+	var args []string
+
+	volName := opts.FsName
+	if volName == "" {
+		volName = opts.Name
+	}
+	if volName != "" {
+		args = append(args, "-n", volName)
+	}
+
+	args = append(args, mountPoint)
+
+	cmd := exec.Command(bin, args...)
+	cmd.ExtraFiles = []*os.File{remote, remoteMon} // fd 3 = data, fd 4 = monitor
+	cmd.Env = append(os.Environ(),
+		"_FUSE_COMMFD=3",
+		"_FUSE_MONFD=4",
+		"_FUSE_COMMVERS=2",
+		"_FUSE_CALL_BY_LIB=",
+		"_FUSE_DAEMON_PATH="+os.Args[0])
+
+	var out, errOut bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errOut
+
+	if err = cmd.Start(); err != nil {
+		local.Close()
+		localMon.Close()
+		return 0, fmt.Errorf("fuse-t: start %s: %w", bin, err)
+	}
+
+	fd, err = getConnection(local)
+	if err != nil {
+		local.Close()
+		localMon.Close()
+		cmd.Process.Kill()
+		return -1, fmt.Errorf("fuse-t: getConnection: %w", err)
+	}
+
+	go func() {
+		defer localMon.Close()
+
+		// Signal go-nfsv4 to perform the NFS mount.
+		if _, werr := localMon.Write([]byte("mount")); werr != nil {
+			ready <- fmt.Errorf("fuse-t: monitor write: %w", werr)
+			close(ready)
+			return
+		}
+
+		// Wait for 4-byte acknowledgement.
+		ack := make([]byte, 4)
+		if _, rerr := localMon.Read(ack); rerr != nil {
+			ready <- fmt.Errorf("fuse-t: mount acknowledgement: %w", rerr)
+			close(ready)
+			return
+		}
+
+		// go-nfsv4 stays running as the NFS server for the
+		// lifetime of the mount.  We do not Wait() here —
+		// the process exits when the filesystem is unmounted.
+		ready <- nil
+		close(ready)
+	}()
+
+	syscall.CloseOnExec(fd)
+	return fd, nil
+}
+
 func unmount(dir string, opts *MountOptions) error {
 	return syscall.Unmount(dir, 0)
 }
 
-func fusermountBinary() (string, error) {
-	binPaths := []string{
+// fusetBinary locates the FUSE-T go-nfsv4 server binary.
+// The FUSE_NFSSRV_PATH environment variable overrides the default
+// search paths.
+func fusetBinary() (string, error) {
+	if p := os.Getenv("FUSE_NFSSRV_PATH"); p != "" {
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+	}
+
+	paths := []string{
+		"/usr/local/bin/go-nfsv4",
+		"/Library/Application Support/fuse-t/bin/go-nfsv4",
+	}
+	for _, p := range paths {
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+	}
+
+	return "", fmt.Errorf("fuse-t: go-nfsv4 not found")
+}
+
+// macfuseBinary locates the macFUSE mount helper binary.
+func macfuseBinary() (string, error) {
+	paths := []string{
 		"/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse",
 		"/Library/Filesystems/osxfuse.fs/Contents/Resources/mount_osxfuse",
 	}
 
-	for _, path := range binPaths {
-		if _, err := os.Stat(path); err == nil {
-			return path, nil
+	for _, p := range paths {
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
 		}
 	}
 
