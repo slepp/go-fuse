@@ -112,10 +112,14 @@ func mountMacfuse(mountPoint string, opts *MountOptions, ready chan<- error) (fd
 //   - A data socket (child fd 3) for the FUSE protocol
 //   - A monitoring socket (child fd 4) for mount lifecycle coordination
 //
-// The parent sends "mount" on the monitoring socket and waits for a
-// 4-byte acknowledgement confirming the NFS mount succeeded.
+// Unlike macFUSE, FUSE-T does not pass a /dev/fuse file descriptor
+// via SCM_RIGHTS. Instead, the FUSE protocol flows directly over the
+// data socket. The parent sends "mount" on the monitoring socket and
+// waits for a 4-byte acknowledgement confirming the NFS mount
+// succeeded.
 func mountFuset(bin string, mountPoint string, opts *MountOptions, ready chan<- error) (fd int, err error) {
-	// Data socket pair — carries the FUSE protocol.
+	// Data socket pair — the FUSE protocol flows directly over this
+	// socket (no /dev/fuse fd passing).
 	local, remote, err := unixgramSocketpair()
 	if err != nil {
 		return 0, err
@@ -162,13 +166,19 @@ func mountFuset(bin string, mountPoint string, opts *MountOptions, ready chan<- 
 		return 0, fmt.Errorf("fuse-t: start %s: %w", bin, err)
 	}
 
-	fd, err = getConnection(local)
+	// FUSE-T sends the FUSE protocol directly over the data socket
+	// rather than passing a /dev/fuse fd via SCM_RIGHTS. Duplicate
+	// the socket fd so the Go runtime's finaliser on local doesn't
+	// close the connection out from under the server.
+	fd, err = syscall.Dup(int(local.Fd()))
 	if err != nil {
 		local.Close()
 		localMon.Close()
 		cmd.Process.Kill()
-		return -1, fmt.Errorf("fuse-t: getConnection: %w", err)
+		return -1, fmt.Errorf("fuse-t: dup: %w", err)
 	}
+	local.Close()
+	syscall.CloseOnExec(fd)
 
 	go func() {
 		defer localMon.Close()
@@ -195,7 +205,6 @@ func mountFuset(bin string, mountPoint string, opts *MountOptions, ready chan<- 
 		close(ready)
 	}()
 
-	syscall.CloseOnExec(fd)
 	return fd, nil
 }
 
