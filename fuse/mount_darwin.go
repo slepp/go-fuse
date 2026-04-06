@@ -145,10 +145,11 @@ func mountFuset(bin string, mountPoint string, opts *MountOptions, ready chan<- 
 		args = append(args, "-n", volName)
 	}
 
-	// Disable FUSE-T's internal NFS attribute cache so the FUSE
-	// entry/attr timeout is the sole caching layer. This avoids
-	// NFS client deadlocks under concurrent access.
-	args = append(args, "--attrcache=false")
+	// Use a short NFS attribute cache timeout. The default (unlimited)
+	// can cause NFS client deadlocks under heavy concurrent access.
+	// 2 seconds provides adequate caching for directory traversals
+	// while avoiding stale-handle issues.
+	args = append(args, "--attrcache-timeout=2")
 
 	args = append(args, mountPoint)
 
