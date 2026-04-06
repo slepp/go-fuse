@@ -145,11 +145,15 @@ func mountFuset(bin string, mountPoint string, opts *MountOptions, ready chan<- 
 		args = append(args, "-n", volName)
 	}
 
-	// Use FSKit backend on macOS 26+ for native userspace filesystem
-	// support without NFS/SMB translation. Falls back to NFS on
-	// older macOS versions (go-nfsv4 ignores unknown backend values
-	// gracefully).
-	args = append(args, "--backend=fskit")
+	// Use SMB backend instead of NFS. The macOS SMB client handles
+	// concurrent access better than NFS on localhost mounts and is
+	// more actively maintained by Apple. If FUSE_T_BACKEND env var
+	// is set, use that instead (allows "nfs", "smb", or "fskit").
+	backend := "smb"
+	if b := os.Getenv("FUSE_T_BACKEND"); b != "" {
+		backend = b
+	}
+	args = append(args, "--backend="+backend)
 
 	args = append(args, mountPoint)
 
