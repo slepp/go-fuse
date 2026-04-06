@@ -145,12 +145,11 @@ func mountFuset(bin string, mountPoint string, opts *MountOptions, ready chan<- 
 		args = append(args, "-n", volName)
 	}
 
-	// Use a moderate NFS attribute cache timeout. Too short causes
-	// thundering-herd GETATTR bursts under parallel access; too long
-	// delays visibility of new files. 30 seconds balances these — the
-	// FUSE entry/attr timeout controls staleness for the FUSE layer,
-	// and the NFS attrcache provides a secondary buffer.
-	args = append(args, "--attrcache-timeout=30")
+	// Use FSKit backend on macOS 26+ for native userspace filesystem
+	// support without NFS/SMB translation. Falls back to NFS on
+	// older macOS versions (go-nfsv4 ignores unknown backend values
+	// gracefully).
+	args = append(args, "--backend=fskit")
 
 	args = append(args, mountPoint)
 
